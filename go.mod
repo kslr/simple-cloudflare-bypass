@@ -5,7 +5,6 @@ go 1.23.0
 require (
 	github.com/2captcha/2captcha-go v1.1.9
 	github.com/go-rod/rod v0.116.2
-	github.com/go-rod/stealth v0.4.9
 	github.com/tidwall/gjson v1.17.3
 )
 
