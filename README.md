@@ -5,9 +5,11 @@ This service helps you bypass Cloudflare’s anti-bot protection by leveraging 2
 ## Usage
 
 ### Install Chrome
+see https://go-rod.github.io/#/compatibility?id=os
+
 
 ### Run the service
-```shell
+```
 Usage of ./app:
   -api-key string
         API key for accessing this service
@@ -20,7 +22,7 @@ Usage of ./app:
 ```
 
 ### Send Requests
-```shell
+```
 POST http://localhost:8080/bypass
 Content-Type: application/json
 Authorization: Bearer myapikey
@@ -33,7 +35,7 @@ Authorization: Bearer myapikey
 ### Response
 Failed Response
 
-```shell
+```
 HTTP/1.1 400 Bad Request
 HTTP/1.1 401 Unauthorized
 
@@ -44,7 +46,7 @@ HTTP/1.1 500
 ```
 
 Successful Response
-```shell
+```
 HTTP/1.1 200 OK
 
 {
