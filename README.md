@@ -4,6 +4,8 @@ This service helps you bypass Cloudflare’s anti-bot protection by leveraging 2
 
 ## Usage
 
+### Install Chrome
+
 ### Run the service
 ```shell
 Usage of ./app:
