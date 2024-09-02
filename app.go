@@ -3,17 +3,16 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
-	api2captcha "github.com/2captcha/2captcha-go"
+	"github.com/charmbracelet/log"
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
-	"github.com/pkg/errors"
 	"github.com/tidwall/gjson"
 )
 
@@ -23,6 +22,7 @@ type QueryRequest struct {
 }
 
 type QueryResponse struct {
+	Message  string                 `json:"message"`
 	Status   int                    `json:"status"`
 	Response string                 `json:"response"`
 	Cookies  []*proto.NetworkCookie `json:"cookies"`
@@ -50,32 +50,47 @@ const i = setInterval(() => {
 `
 
 var (
-	listenAddress      string
-	apiKey             string
-	captchaClient      *api2captcha.Client
-	twocaptchaApiKey   string
-	twocaptchaProxyDsn string
+	listenAddress    string
+	apiKey           string
+	twoCaptchaApiKey string
+	proxyDsn         string
+	proxyParsed      *url.URL
 )
 
 func main() {
 	flag.StringVar(&listenAddress, "listen-address", "0.0.0.0:2316", "HTTP server listen address")
 	flag.StringVar(&apiKey, "api-key", "", "API key for accessing this service")
-	flag.StringVar(&twocaptchaApiKey, "twocaptcha-api-key", "", "2captcha api key")
-	flag.StringVar(&twocaptchaProxyDsn, "twocaptcha-proxy-dsn", "", "2captcha proxy dsn, example: http://user:pass@host:port")
+	flag.StringVar(&proxyDsn, "proxy-dsn", "", "Proxy dsn, example: http://user:pass@host:port")
+	flag.StringVar(&twoCaptchaApiKey, "twocaptcha-api-key", "", "2captcha api key")
 	flag.Parse()
-
-	if twocaptchaApiKey == "" {
-		log.Fatal("2captcha api key is required")
-	}
-	captchaClient = api2captcha.NewClient(twocaptchaApiKey)
 
 	if apiKey == "" {
 		log.Fatal("API key is required")
 	}
+	if twoCaptchaApiKey == "" {
+		log.Fatal("2captcha api key is required")
+	}
+	if proxyDsn == "" {
+		log.Fatal("proxy dsn is required")
+	} else {
+		proxyParse, err := url.Parse(proxyDsn)
+		if err != nil {
+			log.Fatalf("invalid proxy dsn: %s", err)
+		}
+		proxyParsed = proxyParse
+	}
 
 	http.HandleFunc("/bypass", handleQuery)
-	log.Printf("Starting server on %s", listenAddress)
+	log.Infof("Listening on %s", listenAddress)
 	log.Fatal(http.ListenAndServe(listenAddress, nil))
+}
+
+func TouchResponse(w http.ResponseWriter, code int, response *QueryResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func handleQuery(w http.ResponseWriter, r *http.Request) {
@@ -91,14 +106,22 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	var req QueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeFailResponse(w, http.StatusBadRequest, err.Error())
+		TouchResponse(w, http.StatusBadRequest, &QueryResponse{
+			Message: "Invalid request body",
+		})
 		return
 	}
+
+	logger := log.NewWithOptions(os.Stdout, log.Options{
+		ReportCaller:    true,
+		ReportTimestamp: true,
+		Prefix:          "🕷️ " + req.URL,
+	})
 
 	u := launcher.New().
 		UserDataDir("/tmp/chrome-data").
 		NoSandbox(true).
-		Headless(true).
+		Headless(false).
 		Set("user-agent", req.UserAgent).
 		Set("no-sandbox").
 		Set("window-size", "1920,1080").
@@ -134,35 +157,41 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	title := page.MustInfo().Title
 	if title == "Just a moment..." {
+		logger.Info("met cloudflare turnstile")
+
 		select {
 		case <-interceptedDone:
-			log.Printf("interceptedParams: %s in %s", interceptedParams, req.URL)
-			captcha := api2captcha.CloudflareTurnstile{
-				SiteKey:   gjson.Get(interceptedParams, "sitekey").String(),
-				Url:       gjson.Get(interceptedParams, "pageurl").String(),
-				Data:      gjson.Get(interceptedParams, "data").String(),
-				PageData:  gjson.Get(interceptedParams, "pagedata").String(),
-				Action:    gjson.Get(interceptedParams, "action").String(),
-				UserAgent: req.UserAgent,
-			}
-			captchaReq := captcha.ToRequest()
-			u, err := url.Parse(twocaptchaProxyDsn)
+			logger.Info("start solving captcha")
+
+			proxyPassword, _ := proxyParsed.User.Password()
+			solveResult, err := SolveCaptcha(&TurnstileTask{
+				Type:          "TurnstileTask",
+				WebsiteURL:    req.URL,
+				WebsiteKey:    gjson.Get(interceptedParams, "sitekey").String(),
+				UserAgent:     req.UserAgent,
+				Action:        gjson.Get(interceptedParams, "action").String(),
+				Data:          gjson.Get(interceptedParams, "data").String(),
+				PageData:      gjson.Get(interceptedParams, "pagedata").String(),
+				ProxyType:     proxyParsed.Scheme,
+				ProxyAddress:  proxyParsed.Hostname(),
+				ProxyPort:     proxyParsed.Port(),
+				ProxyLogin:    proxyParsed.User.Username(),
+				ProxyPassword: proxyPassword,
+			})
 			if err != nil {
-				writeFailResponse(w, http.StatusInternalServerError, "invalid proxy dsn")
+				TouchResponse(w, http.StatusInternalServerError, &QueryResponse{
+					Message: err.Error(),
+				})
 				return
 			}
-			captchaReq.SetProxy(u.Scheme, strings.TrimPrefix(twocaptchaProxyDsn, u.Scheme+"://"))
-			token, _, err := captchaClient.Solve(captcha.ToRequest())
-			if err != nil {
-				writeFailResponse(w, http.StatusInternalServerError, errors.Wrapf(err, "2captcha solve failed").Error())
-				return
-			}
+			logger.Infof("captcha solved, cost: %s, usedTime(s): %d, solveCount: %d", solveResult.Cost, solveResult.EndTime-solveResult.CreateTime, solveResult.SolveCount)
+
 			redirectWait := page.MustWaitNavigation()
-			log.Printf("2captcha resolved token: %s", token)
-			page.MustEval(`() => window.cfCallback("` + token + `")`)
+			page.MustEval(`() => window.cfCallback("` + solveResult.Solution.Token + `")`)
 			redirectWait()
 		case <-time.After(30 * time.Second):
-			writeFailResponse(w, http.StatusInternalServerError, "wait turnstile timeout")
+			logger.Warn("captcha solving timeout")
+			TouchResponse(w, http.StatusInternalServerError, &QueryResponse{Message: "captcha solving timeout"})
 			return
 		}
 	}
@@ -179,18 +208,6 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
-}
-
-type FailResponse struct {
-	Message string `json:"message"`
-}
-
-func writeFailResponse(w http.ResponseWriter, code int, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	if err := json.NewEncoder(w).Encode(FailResponse{Message: message}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
