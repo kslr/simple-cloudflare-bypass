@@ -1,53 +1,42 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/log"
+	"github.com/gin-gonic/gin"
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
+	"github.com/pkg/errors"
 	"github.com/tidwall/gjson"
 )
 
 type QueryRequest struct {
-	URL       string `json:"url"`
-	UserAgent string `json:"userAgent"`
+	URL       string            `json:"url"`
+	UserAgent string            `json:"userAgent"`
+	Cookies   map[string]string `json:"cookies"`
 }
 
 type QueryResponse struct {
-	Message  string                 `json:"message"`
+	Message     string           `json:"message"`
+	ElapsedTime int              `json:"elapsed_time"`
+	Solution    SolutionResponse `json:"solution"`
+}
+
+type SolutionResponse struct {
+	Url      string                 `json:"url"`
 	Status   int                    `json:"status"`
 	Response string                 `json:"response"`
 	Cookies  []*proto.NetworkCookie `json:"cookies"`
 }
-
-const jsCode = `() => {
-const i = setInterval(() => {
-    if (window.turnstile) {
-        clearInterval(i)
-        window.turnstile.render = (a, b) => {
-            let params = {
-                sitekey: b.sitekey,
-                pageurl: window.location.href,
-                data: b.cData,
-                pagedata: b.chlPageData,
-                action: b.action,
-				json: 1
-            }
-            console.log('intercepted-params:' + JSON.stringify(params))
-            window.cfCallback = b.callback
-        }
-    }
-}, 10)
-}
-`
 
 var (
 	listenAddress    string
@@ -55,6 +44,7 @@ var (
 	twoCaptchaApiKey string
 	proxyDsn         string
 	proxyParsed      *url.URL
+	browser          *rod.Browser
 )
 
 func main() {
@@ -80,60 +70,99 @@ func main() {
 		proxyParsed = proxyParse
 	}
 
-	http.HandleFunc("/bypass", handleQuery)
-	log.Infof("Listening on %s", listenAddress)
-	log.Fatal(http.ListenAndServe(listenAddress, nil))
+	launchUrl := launcher.New().
+		UserDataDir("/tmp/rod").
+		Headless(false).
+		NoSandbox(true).
+		Set("window-size", "1920,1080").
+		Set("disable-setuid-sandbox").
+		Set("disable-dev-shm-usage").
+		Set("no-first-run").
+		Set("disable-blink-features", "AutomationControlled").
+		Set("excludeSwitches", "enable-automation").
+		MustLaunch()
+
+	browser = rod.New().ControlURL(launchUrl).MustConnect()
+	browser.MustVersion()
+
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.Default()
+	router.Use(authMiddleware())
+	router.GET("/health", healthCheck)
+	router.POST("/bypass", handleBypass)
+	srv := &http.Server{
+		Addr:    listenAddress,
+		Handler: router,
+	}
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-quit
+		if err := srv.Close(); err != nil {
+			log.Fatalf("failed to shutdown server: %s", err)
+		}
+	}()
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("failed to start server: %s", err)
+	}
+
+	log.Info("server is shutting down")
 }
 
-func TouchResponse(w http.ResponseWriter, code int, response *QueryResponse) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+func authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		auth := c.GetHeader("Authorization")
+		if auth != "Bearer "+apiKey {
+			c.JSON(http.StatusUnauthorized, gin.H{"message": "Unauthorized"})
+			c.Abort()
+			return
+		}
+		c.Next()
 	}
 }
 
-func handleQuery(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	auth := r.Header.Get("Authorization")
-	if auth != "Bearer "+apiKey {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
+func healthCheck(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
 
+func handleBypass(c *gin.Context) {
 	var req QueryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		TouchResponse(w, http.StatusBadRequest, &QueryResponse{
-			Message: "Invalid request body",
-		})
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid request"})
+		return
+	}
+	bypassUrl, err := url.Parse(req.URL)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": errors.Wrap(err, "invalid url").Error()})
 		return
 	}
 
+	startTime := time.Now()
 	logger := log.NewWithOptions(os.Stdout, log.Options{
 		ReportCaller:    true,
 		ReportTimestamp: true,
 		Prefix:          "🕷️ " + req.URL,
 	})
 
-	u := launcher.New().
-		UserDataDir("/tmp/chrome-data").
-		NoSandbox(true).
-		Headless(false).
-		Set("user-agent", req.UserAgent).
-		Set("no-sandbox").
-		Set("window-size", "1920,1080").
-		Set("disable-setuid-sandbox").
-		Set("disable-dev-shm-usage").
-		Set("no-first-run").
-		Set("disable-blink-features", "AutomationControlled").
-		MustLaunch()
-	browser := rod.New().ControlURL(u).MustConnect()
-	defer browser.MustClose()
+	page := browser.MustPage("").Context(c)
+	defer page.MustClose()
 
-	page := browser.MustPage("")
+	page.MustSetUserAgent(&proto.NetworkSetUserAgentOverride{
+		UserAgent: req.UserAgent,
+	})
+
+	var cookies []*proto.NetworkCookieParam
+	for cookieName, cookieValue := range req.Cookies {
+		cookies = append(cookies, &proto.NetworkCookieParam{
+			Name:   cookieName,
+			Value:  cookieValue,
+			Domain: bypassUrl.Hostname(),
+		})
+	}
+	page.MustSetCookies(cookies...)
 
 	var statusCode int
 	var interceptedParams string
@@ -153,7 +182,26 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 	})()
 
 	page.MustNavigate(req.URL)
-	page.MustEval(jsCode)
+	page.MustEval(`() => {
+const i = setInterval(() => {
+    if (window.turnstile) {
+        clearInterval(i)
+        window.turnstile.render = (a, b) => {
+            let params = {
+                sitekey: b.sitekey,
+                pageurl: window.location.href,
+                data: b.cData,
+                pagedata: b.chlPageData,
+                action: b.action,
+				json: 1
+            }
+            console.log('intercepted-params:' + JSON.stringify(params))
+            window.cfCallback = b.callback
+        }
+    }
+}, 10)
+}
+`)
 
 	title := page.MustInfo().Title
 	if title == "Just a moment..." {
@@ -179,9 +227,7 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 				ProxyPassword: proxyPassword,
 			})
 			if err != nil {
-				TouchResponse(w, http.StatusInternalServerError, &QueryResponse{
-					Message: err.Error(),
-				})
+				c.JSON(http.StatusInternalServerError, gin.H{"message": errors.Wrap(err, "failed to solve captcha").Error()})
 				return
 			}
 			logger.Infof("captcha solved, cost: %s, usedTime(s): %d, solveCount: %d", solveResult.Cost, solveResult.EndTime-solveResult.CreateTime, solveResult.SolveCount)
@@ -191,23 +237,21 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 			redirectWait()
 		case <-time.After(30 * time.Second):
 			logger.Warn("captcha solving timeout")
-			TouchResponse(w, http.StatusInternalServerError, &QueryResponse{Message: "captcha solving timeout"})
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "captcha solving timeout"})
 			return
 		}
 	}
 
-	cookies := page.MustCookies(req.URL)
-	responseBody := page.MustHTML()
-
 	resp := QueryResponse{
-		Status:   statusCode,
-		Response: responseBody,
-		Cookies:  cookies,
+		Message:     "",
+		ElapsedTime: int(time.Since(startTime).Seconds()),
+		Solution: SolutionResponse{
+			Url:      page.MustInfo().URL,
+			Status:   statusCode,
+			Response: page.MustHTML(),
+			Cookies:  page.MustCookies(req.URL),
+		},
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
+	c.PureJSON(http.StatusOK, resp)
 }

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/charmbracelet/log"
 	"github.com/go-resty/resty/v2"
 	"github.com/pkg/errors"
 )
@@ -66,8 +65,6 @@ func SolveCaptcha(task *TurnstileTask) (*GetTaskResultResponse, error) {
 		Task:      task,
 	})
 
-	log.Infof("createTask request payload: %s", createtaskRequestPayload)
-
 	createTaskResponse, err := resty.New().R().
 		SetBody(createtaskRequestPayload).
 		SetResult(&CreateTaskResponse{}).
@@ -79,7 +76,7 @@ func SolveCaptcha(task *TurnstileTask) (*GetTaskResultResponse, error) {
 		return nil, errors.Errorf("createTask error: %s", createTaskResponse.Result().(*CreateTaskResponse).ErrorCode)
 	}
 
-	// 每5秒查询一次，，最多 12 次，超过 60 秒返回错误
+	// per 5 seconds, max 12 times, timeout 60 seconds
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
